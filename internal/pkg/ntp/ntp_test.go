@@ -273,7 +273,7 @@ func (suite *NTPSuite) TestSyncKissOfDeath() {
 	syncer.DisableRTC = true
 
 	syncer.MinPoll = time.Second
-	syncer.MaxPoll = time.Second
+	syncer.MaxPoll = 2 * time.Second
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -307,6 +307,9 @@ func (suite *NTPSuite) TestSyncKissOfDeath() {
 				// kiss of death syncs should be ignored
 				suite.Assert().Equal(time.Millisecond, adj)
 			}
+
+			// afterwards the poll interval should be set to maximum rate
+			suite.Assert().Equal(syncer.PollInterval, syncer.MaxPoll)
 
 			return nil
 		}),

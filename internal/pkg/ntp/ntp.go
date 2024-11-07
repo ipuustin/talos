@@ -45,7 +45,9 @@ type Syncer struct {
 
 	spikeDetector spike.Detector
 
-	MinPoll, MaxPoll, RetryPoll time.Duration
+	MinPoll, MaxPoll time.Duration
+
+	PollInterval time.Duration
 
 	// these functions are overridden in tests for mocking support
 	CurrentTime CurrentTimeFunc
@@ -59,6 +61,7 @@ type Measurement struct {
 	ClockOffset time.Duration
 	Leap        ntp.LeapIndicator
 	Spike       bool
+	RateLimited bool
 }
 
 // NewSyncer creates new Syncer with default configuration.
@@ -76,9 +79,8 @@ func NewSyncer(logger *zap.Logger, timeServers []string) *Syncer {
 
 		spikeDetector: spike.Detector{},
 
-		MinPoll:   MinAllowablePoll,
-		MaxPoll:   MaxAllowablePoll,
-		RetryPoll: RetryPoll,
+		MinPoll: MinAllowablePoll,
+		MaxPoll: MaxAllowablePoll,
 
 		CurrentTime: time.Now,
 		NTPQuery:    ntp.Query,
@@ -174,7 +176,7 @@ func (syncer *Syncer) Run(ctx context.Context) {
 		}
 	}
 
-	pollInterval := time.Duration(0)
+	syncer.PollInterval = time.Duration(0)
 
 	for {
 		lastSyncServer, resp, err := syncer.query(ctx)
@@ -189,40 +191,46 @@ func (syncer *Syncer) Run(ctx context.Context) {
 
 		switch {
 		case resp == nil:
-			// if no response was ever received, consider doing short sleep to retry sooner as it's not Kiss-o-Death response
-			pollInterval = syncer.RetryPoll
-		case pollInterval == 0:
+			// If no response was ever received, consider doing short sleep to
+			// retry sooner as it's not Kiss-o-Death response. The issue here is
+			// that if we are rate limited, the server might not respond, so we
+			// don't want to retry too soon.
+			syncer.PollInterval = syncer.MinPoll
+		case syncer.PollInterval == 0:
 			// first sync
-			pollInterval = syncer.MinPoll
+			syncer.PollInterval = syncer.MinPoll
+		case resp.RateLimited:
+			// rate limited (by the server), retry sync with maximum interval
+			syncer.PollInterval = syncer.MaxPoll
 		case !spike && absDuration(resp.ClockOffset) > ExpectedAccuracy:
 			// huge offset, retry sync with minimum interval
-			pollInterval = syncer.MinPoll
+			syncer.PollInterval = syncer.MinPoll
 		case absDuration(resp.ClockOffset) < ExpectedAccuracy*25/100: // *0.25
 			// clock offset is within 25% of expected accuracy, increase poll interval
-			if pollInterval < syncer.MaxPoll {
-				pollInterval *= 2
+			if syncer.PollInterval < syncer.MaxPoll {
+				syncer.PollInterval *= 2
 			}
 		case spike || absDuration(resp.ClockOffset) > ExpectedAccuracy*75/100: // *0.75
 			// spike was detected or clock offset is too large, decrease poll interval
-			if pollInterval > syncer.MinPoll {
-				pollInterval /= 2
+			if syncer.PollInterval > syncer.MinPoll {
+				syncer.PollInterval /= 2
 			}
 		}
 
-		if resp != nil && pollInterval < syncer.MinPoll {
+		if resp != nil && syncer.PollInterval < syncer.MinPoll {
 			// set poll interval to at least min poll if there was any response
-			pollInterval = syncer.MinPoll
+			syncer.PollInterval = syncer.MinPoll
 		}
 
 		syncer.logger.Debug("sample stats",
 			zap.Duration("jitter", time.Duration(syncer.spikeDetector.Jitter()*float64(time.Second))),
-			zap.Duration("poll_interval", pollInterval),
+			zap.Duration("poll_interval", syncer.PollInterval),
 			zap.Bool("spike", spike),
 			zap.Bool("resp_exists", resp != nil),
 		)
 
 		if resp != nil && !spike {
-			err = syncer.adjustTime(resp.ClockOffset, resp.Leap, lastSyncServer, pollInterval, rtcClock)
+			err = syncer.adjustTime(resp.ClockOffset, resp.Leap, lastSyncServer, syncer.pollInterval, rtcClock)
 
 			if err == nil {
 				if !syncer.timeSyncNotified {
@@ -241,7 +249,7 @@ func (syncer *Syncer) Run(ctx context.Context) {
 			return
 		case <-syncer.restartSyncCh:
 			// time servers got changed, restart the loop immediately
-		case <-time.After(pollInterval):
+		case <-time.After(syncer.PollInterval):
 		}
 	}
 }
@@ -417,6 +425,7 @@ func (syncer *Syncer) queryNTP(server string) (*Measurement, error) {
 		ClockOffset: resp.ClockOffset,
 		Leap:        resp.Leap,
 		Spike:       syncer.isSpike(resp),
+		RateLimited: resp.IsKissOfDeath(),
 	}, nil
 }
 

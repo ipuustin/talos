@@ -11,8 +11,6 @@ const (
 	MinAllowablePoll = 32 * time.Second
 	// MaxAllowablePoll is the maximum allowed interval for querying a time server.
 	MaxAllowablePoll = 2048 * time.Second
-	// RetryPoll is the interval between retries if the error is not Kiss-o-Death.
-	RetryPoll = time.Second
 	// AdjustTimeLimit is a maximum time drift to compensate via adjtimex().
 	//
 	// Deltas smaller than AdjustTimeLimit are gradually adjusted (slewed) to approach the network time.
